@@ -2,7 +2,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import contextlib
 import warnings
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -58,9 +58,9 @@ def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
         None
 
     .. warning::
-        When calling this function, :func:`manual_seed` must be called from all ranks of the
-        default ``ProcessGroup`` even if some ranks may not be a part of the ``device_mesh``,
-        with the same ``seed`` value.
+        :func:`manual_seed` does not check the ``seed`` value correctness. Users must
+        ensure on their own that the value passed in is the desired ``seed`` for ranks
+        within ``device_mesh``.
         If ``device_mesh`` is a sub-mesh and the calling rank is not a part of it,
         ``manual_seed`` will not set its GPU device's generator seed.
         Current implementation only supports a GPU device mesh.
@@ -71,20 +71,13 @@ def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
             f"DTensor randomness only supports cuda/cuda-like device type, but got {device_mesh.device_type}"
         )
 
-    # allgather the seed over the default PG
-    object_list = [seed] * dist.get_world_size()
-    dist.all_gather_object(object_list, seed)
-    for rank, object in enumerate(object_list):
-        if seed != int(object):
-            raise RuntimeError(
-                f"calling manual_seed function over {device_mesh} but received different seed values on ranks:",
-                f"seed on rank {dist.get_rank()} is {seed}, and seed on rank {rank} is {object}!",
-            )
     # instantiate a RNG tracker if haven't. By default DTensor uses an
     # OffsetBasedRNGTracker to perform random operators.
     global _rng_tracker
     if not _rng_tracker:
-        _rng_tracker = OffsetBasedRNGTracker(device_mesh.device_type)
+        _rng_tracker = OffsetBasedRNGTracker(
+            device_mesh.device_type, run_state_sync=False
+        )
 
     # the current rank is in mesh
     if device_mesh.get_coordinate() is not None:
@@ -157,11 +150,13 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
     random operators.
     """
 
-    def __init__(self, device_type: str = "cuda"):
+    def __init__(self, device_type: str = "cuda", run_state_sync: bool = True):
         super().__init__(device_type)
-        # synchronize RNG state using rank 0's current one
         rng_state = self._device_handle.get_rng_state().to(device_type)
-        dist.broadcast(rng_state, 0)
+        if run_state_sync:
+            # synchronize RNG state using rank 0's current one
+            dist.broadcast(rng_state, 0)
+
         self.rng_states["parallel-rng"] = rng_state.to("cpu")
 
     def _manual_seed(self, parallel_seed: int) -> None:
@@ -257,23 +252,48 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
         """
         dtensor_shape = spec.shape
         mesh = spec.mesh
-        dim_map = spec.dim_map
+        # note: dim_map does not allow double sharding which is the FSDP(fully_shard)+TP
+        # case. Replace the custom logic with dim_map once we support it.
+        dim_map: List[Union[int, List[int]]] = [-1] * spec.ndim
+        for i, placement in enumerate(spec.placements):
+            if isinstance(placement, Shard):
+                shard_dim = placement.dim
+                if dim_map[shard_dim] == -1:
+                    dim_map[shard_dim] = [i]
+                else:
+                    mesh_dim_list = dim_map[shard_dim]
+                    assert isinstance(mesh_dim_list, List)
+                    mesh_dim_list.append(i)
 
         # Compute shard coordinate:
         # The coordinate on each tensor dim is a tuple (idx, range)
         # If a DTensor is partitioned on its dim i into n shards, and the current rank
         # holds the j-th, then its shard coordinate will be (idx=j, range=n) on dim i
-        coordinate = mesh.get_coordinate()
-        assert coordinate is not None
-        shard_coord = [
-            coordinate[mesh_dim] if mesh_dim >= 0 else 0 for mesh_dim in dim_map
-        ]
-        shard_size = [
-            mesh.size(mesh_dim) if mesh_dim >= 0 else 1 for mesh_dim in dim_map
-        ]
+        mesh_coordinate = mesh.get_coordinate()
+        assert mesh_coordinate is not None
+        mesh_size = mesh.shape
+        shard_idx_by_dim = []
+        total_num_shards_by_dim = []  # total number of shards on each tensor dim
+        for mesh_dim in dim_map:
+            shard_idx = 0
+            total_num_shards = 1
+            # the tensor dim is sharded on more than 1 mesh dim
+            if isinstance(mesh_dim, List):
+                assert isinstance(mesh_dim, List)
+                rank_coord = [mesh_coordinate[d] for d in mesh_dim]
+                num_shards = [mesh_size[d] for d in mesh_dim]
+                # compute the shard idx and total number of shards
+                for idx, size in zip(rank_coord, num_shards):
+                    shard_idx = shard_idx * size + idx
+                    total_num_shards *= size
+
+            shard_idx_by_dim.append(shard_idx)
+            total_num_shards_by_dim.append(total_num_shards)
 
         # compute shard linear index
-        shard_linear_idx = self._calc_shard_linear_idx(shard_coord, shard_size)
+        shard_linear_idx = self._calc_shard_linear_idx(
+            shard_idx_by_dim, total_num_shards_by_dim
+        )
 
         # compute starting offset using the first shard's size
         local_size_on_rank_0 = list(dtensor_shape)
